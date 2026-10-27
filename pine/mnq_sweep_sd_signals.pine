@@ -1,0 +1,476 @@
+//@version=6
+// MNQ Liquidity Sweep + Supply/Demand Signals  —  SIGNALS ONLY, NO ORDERS
+// Simulated $100k account · $7,000 profit target · $3,000 HARD max daily loss
+// An indicator cannot place orders. A built-in virtual tracker paper-trades each
+// signal so lockouts (daily loss, streaks, give-back, target) block later signals.
+// Recommended chart: MNQ1! 5-minute, ETH session (so overnight levels exist).
+indicator("MNQ Sweep + S/D Signals (Simulated)", shorttitle = "MNQ Sweep SD", overlay = true,
+     max_boxes_count = 60, max_labels_count = 300, max_lines_count = 50)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+const string GR = "Risk — $100k simulated account"
+float acct       = input.float(100000, "Account size ($)", group = GR)
+float profitTgt  = input.float(7000, "Account profit target ($)", group = GR)
+bool  haltAtTgt  = input.bool(true, "Stop signalling once target is hit", group = GR)
+float maxDayLoss = input.float(3000, "HARD max daily loss ($)", group = GR)
+float lossBuf    = input.float(250, "Stop new trades this far before the limit ($)", group = GR)
+float riskTrade  = input.float(500, "Risk per trade ($)", group = GR)
+int   redAfter   = input.int(2, "Reduce risk after N straight losses", group = GR)
+float redFactor  = input.float(0.5, "Reduced risk factor", group = GR)
+int   maxTrades  = input.int(6, "Max trades per day", group = GR)
+int   maxConsec  = input.int(3, "Stop the day after N straight losses", group = GR)
+float gbActivate = input.float(1500, "Give-back guard activates at day P&L ($)", group = GR)
+float gbPct      = input.float(50, "Max give-back of day peak (%)", group = GR) / 100
+int   coolBars   = input.int(3, "Cooldown bars after a loss", group = GR)
+int   maxQty     = input.int(15, "Max contracts", group = GR)
+float pv         = input.float(2.0, "Point value ($/pt, MNQ = 2)", group = GR)
+float comm       = input.float(0.85, "Commission per side per contract ($)", group = GR)
+int   slipTicks  = input.int(1, "Slippage (ticks)", group = GR)
+
+const string GS = "Stops & targets (volatility based)"
+int   atrLen     = input.int(14, "ATR length", group = GS)
+float atrMult    = input.float(1.0, "Minimum stop (x ATR)", group = GS)
+float atrBuf     = input.float(0.25, "Buffer beyond sweep wick (x ATR)", group = GS)
+float maxStopAtr = input.float(3.0, "Skip setup if stop > x ATR", group = GS)
+float minStopPts = input.float(6.0, "Minimum stop (points)", group = GS)
+float rr         = input.float(2.0, "Reward : risk", group = GS)
+float beR        = input.float(1.0, "Move stop to breakeven at R (0 = off)", group = GS)
+
+const string GE = "Signal engine"
+int   swingLen = input.int(5, "Swing pivot strength", group = GE)
+int   lvlAge   = input.int(400, "Liquidity level max age (bars)", group = GE)
+int   maxLvls  = input.int(20, "Max levels per side", group = GE)
+float minWick  = input.float(0.25, "Min rejection wick / range", group = GE)
+float impMult  = input.float(1.5, "Impulse candle body (x ATR)", group = GE)
+float baseMax  = input.float(0.6, "Base candle max body (x ATR)", group = GE)
+int   maxZones = input.int(6, "Max zones per side", group = GE)
+int   zoneAge  = input.int(300, "Zone max age (bars)", group = GE)
+int   minScore = input.int(2, "Min confluence score (0-4)", minval = 0, maxval = 4, group = GE)
+int   emaFLen  = input.int(9, "EMA fast", group = GE)
+int   emaMLen  = input.int(21, "EMA mid", group = GE)
+int   emaSLen  = input.int(50, "EMA slow", group = GE)
+int   emaTLen  = input.int(200, "EMA trend (display)", group = GE)
+int   rsiLen   = input.int(14, "RSI length", group = GE)
+float rsiLo    = input.float(35, "RSI exhaustion low", group = GE)
+float rsiHi    = input.float(65, "RSI exhaustion high", group = GE)
+int   volLen   = input.int(20, "Volume average length", group = GE)
+float volMult  = input.float(1.5, "Volume spike (x avg)", group = GE)
+
+const string GT = "Session (New York time)"
+string entrySess = input.session("0935-1530", "Entry window", group = GT)
+string flatSess  = input.session("1550-1800", "Flatten window", group = GT)
+string rthSess   = input.session("0930-1600", "Regular session", group = GT)
+
+const string GV = "Display"
+bool showZones  = input.bool(true, "Supply/demand zones", group = GV)
+bool showLevels = input.bool(true, "PDH/PDL & overnight high/low", group = GV)
+bool showEmas   = input.bool(true, "EMAs", group = GV)
+bool showVwap   = input.bool(true, "VWAP", group = GV)
+bool showPanel  = input.bool(true, "Risk panel", group = GV)
+bool showBlocked = input.bool(true, "Mark blocked signals", group = GV)
+
+// ───────────────────────────── Core series ─────────────────────────────
+const string TZ = "America/New_York"
+inSess(string s) => not na(time(timeframe.period, s, TZ))
+bool inEntry = inSess(entrySess)
+bool inFlat  = inSess(flatSess)
+bool inRTH   = inSess(rthSess)
+bool isON    = not inSess("0930-1800")
+bool newDay  = timeframe.change("D")
+float tick   = syminfo.mintick
+float slip   = slipTicks * tick
+
+float atr     = ta.atr(atrLen)
+float emaF    = ta.ema(close, emaFLen)
+float emaM    = ta.ema(close, emaMLen)
+float emaS    = ta.ema(close, emaSLen)
+float emaT    = ta.ema(close, emaTLen)
+float vwapV   = ta.vwap(hlc3)
+float rsi     = ta.rsi(close, rsiLen)
+float rsiMin3 = ta.lowest(rsi, 3)
+float rsiMax3 = ta.highest(rsi, 3)
+float volAvg  = ta.sma(volume, volLen)
+float ph      = ta.pivothigh(high, swingLen, swingLen)
+float pl      = ta.pivotlow(low, swingLen, swingLen)
+
+// ───────────────────────────── Session levels ─────────────────────────────
+var float dayHi = na
+var float dayLo = na
+var float pdh   = na
+var float pdl   = na
+var float onHi  = na
+var float onLo  = na
+var bool  rthSeeded = false
+if newDay
+    pdh := dayHi
+    pdl := dayLo
+    dayHi := na
+    dayLo := na
+    onHi := na
+    onLo := na
+    rthSeeded := false
+dayHi := na(dayHi) ? high : math.max(dayHi, high)
+dayLo := na(dayLo) ? low : math.min(dayLo, low)
+if isON
+    onHi := na(onHi) ? high : math.max(onHi, high)
+    onLo := na(onLo) ? low : math.min(onLo, low)
+
+// ───────────────────────────── Liquidity book ─────────────────────────────
+var array<float>  hiP = array.new<float>()
+var array<int>    hiB = array.new<int>()
+var array<string> hiK = array.new<string>()
+var array<float>  loP = array.new<float>()
+var array<int>    loB = array.new<int>()
+var array<string> loK = array.new<string>()
+
+addLevel(array<float> p, array<int> b, array<string> k, float price, string kind) =>
+    if not na(price)
+        p.push(price)
+        b.push(bar_index)
+        k.push(kind)
+        if p.size() > maxLvls
+            p.shift()
+            b.shift()
+            k.shift()
+
+if inRTH and not rthSeeded
+    rthSeeded := true
+    addLevel(hiP, hiB, hiK, pdh, "PDH")
+    addLevel(loP, loB, loK, pdl, "PDL")
+    addLevel(hiP, hiB, hiK, onHi, "ONH")
+    addLevel(loP, loB, loK, onLo, "ONL")
+
+// zone touch is measured against zones that existed before this bar
+var array<float> dTop = array.new<float>()
+var array<float> dBot = array.new<float>()
+var array<int>   dBar = array.new<int>()
+var array<box>   dBox = array.new<box>()
+var array<float> sTop = array.new<float>()
+var array<float> sBot = array.new<float>()
+var array<int>   sBar = array.new<int>()
+var array<box>   sBox = array.new<box>()
+
+bool inDemand = false
+bool inSupply = false
+if dTop.size() > 0
+    for j = 0 to dTop.size() - 1
+        if low <= dTop.get(j) and high >= dBot.get(j)
+            inDemand := true
+if sTop.size() > 0
+    for j = 0 to sTop.size() - 1
+        if low <= sTop.get(j) and high >= sBot.get(j)
+            inSupply := true
+
+// sweeps: trade through a level, close back on the original side
+float  bullLvl  = na
+string bullKind = ""
+if loP.size() > 0
+    for j = loP.size() - 1 to 0
+        float lv     = loP.get(j)
+        bool expired = bar_index - loB.get(j) > lvlAge
+        bool swept   = low < lv and close > lv
+        if swept and not expired and (na(bullLvl) or lv < bullLvl)
+            bullLvl  := lv
+            bullKind := loK.get(j)
+        if expired or swept or close < lv
+            loP.remove(j)
+            loB.remove(j)
+            loK.remove(j)
+
+float  bearLvl  = na
+string bearKind = ""
+if hiP.size() > 0
+    for j = hiP.size() - 1 to 0
+        float lv     = hiP.get(j)
+        bool expired = bar_index - hiB.get(j) > lvlAge
+        bool swept   = high > lv and close < lv
+        if swept and not expired and (na(bearLvl) or lv > bearLvl)
+            bearLvl  := lv
+            bearKind := hiK.get(j)
+        if expired or swept or close > lv
+            hiP.remove(j)
+            hiB.remove(j)
+            hiK.remove(j)
+
+// ───────────────────────────── Supply / demand zones ─────────────────────────────
+color dCol = showZones ? color.new(color.teal, 85) : na
+color sCol = showZones ? color.new(color.maroon, 85) : na
+if dTop.size() > 0
+    for j = dTop.size() - 1 to 0
+        if close < dBot.get(j) or bar_index - dBar.get(j) > zoneAge
+            box.delete(dBox.get(j))
+            dTop.remove(j)
+            dBot.remove(j)
+            dBar.remove(j)
+            dBox.remove(j)
+        else
+            box.set_right(dBox.get(j), bar_index)
+if sTop.size() > 0
+    for j = sTop.size() - 1 to 0
+        if close > sTop.get(j) or bar_index - sBar.get(j) > zoneAge
+            box.delete(sBox.get(j))
+            sTop.remove(j)
+            sBot.remove(j)
+            sBar.remove(j)
+            sBox.remove(j)
+        else
+            box.set_right(sBox.get(j), bar_index)
+
+float body   = math.abs(close - open)
+bool  baseOk = math.abs(close[1] - open[1]) <= baseMax * atr
+if bar_index > 0 and not na(atr) and body >= impMult * atr and baseOk
+    if close > open
+        dTop.push(high[1])
+        dBot.push(low[1])
+        dBar.push(bar_index - 1)
+        dBox.push(box.new(bar_index - 1, high[1], bar_index, low[1], border_color = dCol, bgcolor = dCol))
+        if dTop.size() > maxZones
+            box.delete(dBox.shift())
+            dTop.shift()
+            dBot.shift()
+            dBar.shift()
+    else
+        sTop.push(high[1])
+        sBot.push(low[1])
+        sBar.push(bar_index - 1)
+        sBox.push(box.new(bar_index - 1, high[1], bar_index, low[1], border_color = sCol, bgcolor = sCol))
+        if sTop.size() > maxZones
+            box.delete(sBox.shift())
+            sTop.shift()
+            sBot.shift()
+            sBar.shift()
+
+// new swing points become liquidity after the sweep check
+if not na(ph)
+    addLevel(hiP, hiB, hiK, ph, "swing")
+if not na(pl)
+    addLevel(loP, loB, loK, pl, "swing")
+
+// ───────────────────────────── Setups ─────────────────────────────
+bool  warm     = not na(atr) and not na(emaS) and not na(rsiMin3)
+float rng      = high - low
+bool  volSpike = not na(volAvg) and volume > volAvg * volMult
+bool  both     = not na(bullLvl) and not na(bearLvl)
+
+int longScore  = (inDemand ? 1 : 0) + (emaM > emaS ? 1 : 0) + (close > emaF ? 1 : 0) + (rsiMin3 < rsiLo or volSpike ? 1 : 0)
+int shortScore = (inSupply ? 1 : 0) + (emaM < emaS ? 1 : 0) + (close < emaF ? 1 : 0) + (rsiMax3 > rsiHi or volSpike ? 1 : 0)
+
+float longStopRaw  = math.min(low - atrBuf * atr, close - atrMult * atr, close - minStopPts)
+float shortStopRaw = math.max(high + atrBuf * atr, close + atrMult * atr, close + minStopPts)
+float longStop  = math.round_to_mintick(longStopRaw)
+float shortStop = math.round_to_mintick(shortStopRaw)
+float longTgt   = math.round_to_mintick(close + rr * (close - longStop))
+float shortTgt  = math.round_to_mintick(close - rr * (shortStop - close))
+
+bool longSig = warm and inEntry and not na(bullLvl) and not both and rng > 0
+     and (math.min(open, close) - low) / rng >= minWick
+     and longScore >= minScore and close - longStopRaw <= maxStopAtr * atr
+bool shortSig = warm and inEntry and not na(bearLvl) and not both and rng > 0
+     and (high - math.max(open, close)) / rng >= minWick
+     and shortScore >= minScore and shortStopRaw - close <= maxStopAtr * atr
+
+// ───────────────────────────── Virtual paper tracker / risk ─────────────────────────────
+var int    pDir = 0
+var float  pStop = na
+var float  pAtr = na
+var int    pos = 0
+var int    qty = 0
+var float  ePx = na
+var float  sPx = na
+var float  tPx = na
+var float  hPx = na
+var float  rPts = na
+var bool   beDone = false
+var float  dayPnl = 0.0
+var float  dayPeak = 0.0
+var int    tradesToday = 0
+var int    consec = 0
+var float  totPnl = 0.0
+var bool   tgtHit = false
+var int    coolUntil = -1
+var int    nTrades = 0
+var int    nWins = 0
+
+if newDay
+    dayPnl := 0.0
+    dayPeak := 0.0
+    tradesToday := 0
+    consec := 0
+    coolUntil := -1
+    pDir := 0
+
+blockReason() =>
+    string why = ""
+    if tgtHit and haltAtTgt
+        why := "profit target reached"
+    else if dayPnl <= -(maxDayLoss - lossBuf)
+        why := "daily loss limit"
+    else if tradesToday >= maxTrades
+        why := "max trades/day"
+    else if consec >= maxConsec
+        why := "consecutive losses"
+    else if dayPeak >= gbActivate and dayPnl <= dayPeak * (1 - gbPct)
+        why := "profit give-back"
+    else if bar_index < coolUntil
+        why := "cooldown"
+    why
+
+costPer(float pts) => pts * pv + 2 * comm + slip * pv
+
+sizeFor(float pts) =>
+    float risk = riskTrade * (consec >= redAfter ? redFactor : 1.0)
+    risk := math.max(0.0, math.min(risk, maxDayLoss + dayPnl - lossBuf))
+    pts > 0 ? math.min(maxQty, math.floor(risk / costPer(pts))) : 0
+
+// 1) fill the pending signal at this bar's open
+if pDir != 0 and pos == 0
+    if blockReason() == "" and not inFlat
+        float fill = pDir == 1 ? open + slip : open - slip
+        float pts  = pDir == 1 ? fill - pStop : pStop - fill
+        int   q    = sizeFor(pts)
+        if pts > 0 and pts <= maxStopAtr * pAtr and q >= 1
+            pos    := pDir
+            qty    := q
+            ePx    := fill
+            rPts   := pts
+            tPx    := pDir == 1 ? fill + rr * pts : fill - rr * pts
+            float roomPts = math.floor(((maxDayLoss + dayPnl - 2 * comm * q) / (q * pv) - slip) / tick) * tick
+            hPx    := pDir == 1 ? fill - roomPts : fill + roomPts
+            sPx    := pDir == 1 ? math.max(pStop, hPx) : math.min(pStop, hPx)
+            beDone := false
+    pDir := 0
+
+// 2) manage the open position (stop is assumed to fill before target)
+float  exitPx  = na
+string exitWhy = ""
+if pos != 0
+    string sw = sPx == hPx ? "hard daily stop" : beDone ? "breakeven" : "stop"
+    if pos == 1
+        if open <= sPx
+            exitPx  := open - slip
+            exitWhy := sw + " (gap)"
+        else if low <= sPx
+            exitPx  := sPx - slip
+            exitWhy := sw
+        else if open >= tPx
+            exitPx  := open
+            exitWhy := "target (gap)"
+        else if high >= tPx
+            exitPx  := tPx
+            exitWhy := "target"
+    else
+        if open >= sPx
+            exitPx  := open + slip
+            exitWhy := sw + " (gap)"
+        else if high >= sPx
+            exitPx  := sPx + slip
+            exitWhy := sw
+        else if open <= tPx
+            exitPx  := open
+            exitWhy := "target (gap)"
+        else if low <= tPx
+            exitPx  := tPx
+            exitWhy := "target"
+    if na(exitPx) and inFlat
+        exitPx  := pos == 1 ? close - slip : close + slip
+        exitWhy := "EOD flatten"
+    if not na(exitPx)
+        float pnl = (exitPx - ePx) * pos * qty * pv - 2 * comm * qty
+        dayPnl  += pnl
+        totPnl  += pnl
+        dayPeak := math.max(dayPeak, dayPnl)
+        tradesToday += 1
+        nTrades += 1
+        if pnl < 0
+            consec += 1
+            coolUntil := bar_index + coolBars
+        else
+            consec := 0
+            nWins += 1
+        if totPnl >= profitTgt
+            tgtHit := true
+        label.new(bar_index, exitPx, (pnl >= 0 ? "+" : "") + str.tostring(pnl, "#,##0") + "  " + exitWhy,
+             style = label.style_label_left, size = size.tiny,
+             color = color.new(pnl >= 0 ? color.green : color.red, 70), textcolor = chart.fg_color)
+        pos := 0
+    else if beR > 0 and not beDone
+        if pos == 1 and high >= ePx + beR * rPts
+            sPx := math.max(sPx, ePx + tick)
+            beDone := true
+        else if pos == -1 and low <= ePx - beR * rPts
+            sPx := math.min(sPx, ePx - tick)
+            beDone := true
+
+// 3) new signals (entry = next bar open)
+string blockNow  = blockReason()
+bool   longTake  = longSig and pos == 0 and blockNow == ""
+bool   shortTake = shortSig and pos == 0 and blockNow == "" and not longTake
+bool   blocked   = (longSig or shortSig) and not longTake and not shortTake
+
+jsonMsg(string side, float stop, float tgt, int q, int score, string kind) =>
+    '{"mode":"signal","live":false,"symbol":"' + syminfo.ticker + '","side":"' + side +
+     '","ref":' + str.tostring(close) + ',"stop":' + str.tostring(stop) + ',"target":' + str.tostring(tgt) +
+     ',"qty":' + str.tostring(q) + ',"score":' + str.tostring(score) + ',"sweep":"' + kind +
+     '","dayPnl":' + str.tostring(dayPnl, "#.##") + '}'
+
+if longTake
+    pDir  := 1
+    pStop := longStop
+    pAtr  := atr
+    int q = sizeFor(close - longStop)
+    label.new(bar_index, low, "LONG " + str.tostring(q) + " MNQ\nSL " + str.tostring(longStop, format.mintick) +
+         "\nTP " + str.tostring(longTgt, format.mintick) + "\n" + str.tostring(longScore) + "/4 · " + bullKind + " sweep",
+         style = label.style_label_up, size = size.small, color = color.new(color.green, 10), textcolor = color.white)
+    alert(jsonMsg("long", longStop, longTgt, q, longScore, bullKind), alert.freq_once_per_bar_close)
+if shortTake
+    pDir  := -1
+    pStop := shortStop
+    pAtr  := atr
+    int q = sizeFor(shortStop - close)
+    label.new(bar_index, high, "SHORT " + str.tostring(q) + " MNQ\nSL " + str.tostring(shortStop, format.mintick) +
+         "\nTP " + str.tostring(shortTgt, format.mintick) + "\n" + str.tostring(shortScore) + "/4 · " + bearKind + " sweep",
+         style = label.style_label_down, size = size.small, color = color.new(color.red, 10), textcolor = color.white)
+    alert(jsonMsg("short", shortStop, shortTgt, q, shortScore, bearKind), alert.freq_once_per_bar_close)
+if blocked and showBlocked
+    label.new(bar_index, longSig ? low : high, "blocked: " + (pos != 0 ? "in position" : blockNow),
+         style = longSig ? label.style_label_up : label.style_label_down, size = size.tiny,
+         color = color.new(color.gray, 60), textcolor = chart.fg_color)
+
+alertcondition(longTake, "MNQ long signal", "MNQ LONG signal on {{ticker}} near {{close}} (simulated, no order)")
+alertcondition(shortTake, "MNQ short signal", "MNQ SHORT signal on {{ticker}} near {{close}} (simulated, no order)")
+alertcondition(blockNow == "daily loss limit" and blockNow[1] != "daily loss limit", "MNQ daily loss lock", "MNQ: daily loss limit reached — stop trading today")
+alertcondition(tgtHit and not tgtHit[1], "MNQ profit target hit", "MNQ: $ profit target reached")
+
+// ───────────────────────────── Plots ─────────────────────────────
+plot(showEmas ? emaF : na, "EMA fast", color.new(color.yellow, 0), 1)
+plot(showEmas ? emaM : na, "EMA mid", color.new(color.orange, 0), 1)
+plot(showEmas ? emaS : na, "EMA slow", color.new(color.fuchsia, 0), 2)
+plot(showEmas ? emaT : na, "EMA trend", color.new(color.gray, 0), 2)
+plot(showVwap ? vwapV : na, "VWAP", color.new(color.aqua, 0), 2, plot.style_circles)
+plot(showLevels ? pdh : na, "PDH", color.new(color.red, 30), 1, plot.style_linebr)
+plot(showLevels ? pdl : na, "PDL", color.new(color.green, 30), 1, plot.style_linebr)
+plot(showLevels and inRTH ? onHi : na, "ONH", color.new(color.red, 60), 1, plot.style_linebr)
+plot(showLevels and inRTH ? onLo : na, "ONL", color.new(color.green, 60), 1, plot.style_linebr)
+plot(pos != 0 ? sPx : na, "Active stop", color.red, 2, plot.style_linebr)
+plot(pos != 0 ? tPx : na, "Active target", color.green, 2, plot.style_linebr)
+bgcolor(blockNow != "" and blockNow != "cooldown" and inRTH ? color.new(color.red, 93) : na, title = "Locked")
+
+var table panel = table.new(position.top_right, 2, 8, bgcolor = color.new(color.black, 20), border_width = 1)
+if showPanel and barstate.islast
+    string status = blockNow == "" ? "ACTIVE" : "LOCKED: " + blockNow
+    table.cell(panel, 0, 0, "MNQ SIM ($" + str.tostring(acct, "#,###") + ")", text_color = color.white)
+    table.cell(panel, 1, 0, status, text_color = blockNow == "" ? color.lime : color.red)
+    table.cell(panel, 0, 1, "Day P&L", text_color = color.white)
+    table.cell(panel, 1, 1, str.tostring(dayPnl, "#,##0"), text_color = dayPnl >= 0 ? color.lime : color.red)
+    table.cell(panel, 0, 2, "Room to -$" + str.tostring(maxDayLoss, "#,###"), text_color = color.white)
+    table.cell(panel, 1, 2, str.tostring(maxDayLoss + dayPnl, "#,##0"), text_color = color.white)
+    table.cell(panel, 0, 3, "Total / target", text_color = color.white)
+    table.cell(panel, 1, 3, str.tostring(totPnl, "#,##0") + " / " + str.tostring(profitTgt, "#,###"), text_color = totPnl >= 0 ? color.lime : color.red)
+    table.cell(panel, 0, 4, "Trades today", text_color = color.white)
+    table.cell(panel, 1, 4, str.tostring(tradesToday) + " / " + str.tostring(maxTrades), text_color = color.white)
+    table.cell(panel, 0, 5, "Loss streak", text_color = color.white)
+    table.cell(panel, 1, 5, str.tostring(consec), text_color = color.white)
+    table.cell(panel, 0, 6, "Win rate (sim)", text_color = color.white)
+    table.cell(panel, 1, 6, nTrades > 0 ? str.tostring(100.0 * nWins / nTrades, "#.0") + "% of " + str.tostring(nTrades) : "-", text_color = color.white)
+    table.cell(panel, 0, 7, "Position", text_color = color.white)
+    table.cell(panel, 1, 7, pos == 0 ? "flat" : (pos == 1 ? "LONG " : "SHORT ") + str.tostring(qty), text_color = color.white)
